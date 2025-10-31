@@ -1,3 +1,5 @@
 .vs/
-/BarcodeScannerServer/bin/
-/BarcodeScannerServer/obj/
+BarcodeScannerServer/bin/
+BarcodeScannerServer/obj/
+BarcodeScannerServer/obj/Debug/net8.0-windows/BarcodeScannerServer.AssemblyInfo.cs
+BarcodeScannerServer/obj/Debug/net8.0-windows/BarcodeScannerServer.AssemblyInfoInputs.cache
