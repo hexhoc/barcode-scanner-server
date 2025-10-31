@@ -1,7 +1,11 @@
 ﻿using System;
+using System.IO.Ports;
 using System.Net;
 using System.Net.WebSockets;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
 
 namespace BarcodeScannerServer
 {
@@ -10,6 +14,8 @@ namespace BarcodeScannerServer
         private HttpListener httpListener;
         private CancellationTokenSource cancellationTokenSource;
         private bool isRunning = false;
+        private SerialPort barcodeScanner;
+        private bool isScannerListening = false;
 
         // Colors for different log types
         private readonly Color ColorNormal = Color.Black;
@@ -20,9 +26,56 @@ namespace BarcodeScannerServer
         private readonly Color ColorReceived = Color.Purple;
         private readonly Color ColorSent = Color.DarkGreen;
 
+        // Store connected WebSocket clients
+        private readonly List<WebSocket> connectedClients = new List<WebSocket>();
+        private readonly object clientsLock = new object();
+
         public MainForm()
         {
             InitializeComponent();
+            InitializeScannerControls();
+        }
+
+        private void InitializeScannerControls()
+        {
+            // Populate COM ports dropdown
+            PopulateComPorts();
+
+            // Set default baud rate
+            comboBoxBaudRate.SelectedItem = "9600";
+
+            // Set default data bits
+            comboBoxDataBits.SelectedItem = "8";
+
+            // Set default stop bits
+            comboBoxStopBits.SelectedItem = "One";
+
+            // Set default parity
+            comboBoxParity.SelectedItem = "None";
+        }
+
+        private void PopulateComPorts()
+        {
+            comboBoxComPort.Items.Clear();
+            string[] ports = SerialPort.GetPortNames();
+            Array.Sort(ports);
+            comboBoxComPort.Items.AddRange(ports);
+
+            if (comboBoxComPort.Items.Count > 0)
+            {
+                comboBoxComPort.SelectedIndex = 0;
+            }
+        }
+
+        private void ButtonRefreshPorts_Click(object sender, EventArgs e)
+        {
+            PopulateComPorts();
+            LogMessage("COM ports refreshed", ColorInfo);
+        }
+
+        private void ButtonCheckScanner_Click(object sender, EventArgs e)
+        {
+            
         }
 
         private void MainForm_Load(object sender, EventArgs e)
@@ -131,6 +184,12 @@ namespace BarcodeScannerServer
 
                         LogMessage($"Client connected from {context.Request.RemoteEndPoint}", ColorSuccess);
 
+                        // Add client to connected clients list
+                        lock (clientsLock)
+                        {
+                            connectedClients.Add(webSocket);
+                        }
+
                         // Handle the WebSocket connection in background
                         _ = Task.Run(async () => await HandleWebSocketConnection(webSocket));
                     }
@@ -202,8 +261,180 @@ namespace BarcodeScannerServer
             }
             finally
             {
+                // Remove client from connected clients list
+                lock (clientsLock)
+                {
+                    connectedClients.Remove(webSocket);
+                }
                 webSocket?.Dispose();
             }
+        }
+
+        private void StartBarcodeScanner()
+        {
+            if (isScannerListening)
+            {
+                LogMessage("Barcode scanner is already listening", ColorWarning);
+                return;
+            }
+
+            if (comboBoxComPort.SelectedItem == null)
+            {
+                LogMessage("Please select a COM port", ColorError);
+                return;
+            }
+
+            try
+            {
+                // Configure serial port
+                barcodeScanner = new SerialPort
+                {
+                    PortName = comboBoxComPort.SelectedItem.ToString(),
+                    BaudRate = int.Parse(comboBoxBaudRate.SelectedItem.ToString()),
+                    DataBits = int.Parse(comboBoxDataBits.SelectedItem.ToString()),
+                    StopBits = GetStopBits(comboBoxStopBits.SelectedItem.ToString()),
+                    Parity = GetParity(comboBoxParity.SelectedItem.ToString()),
+                    Handshake = Handshake.None,
+                    ReadTimeout = 1000,
+                    WriteTimeout = 1000
+                };
+
+                // Subscribe to data received event
+                barcodeScanner.DataReceived += BarcodeScanner_DataReceived;
+
+                // Open the serial port
+                barcodeScanner.Open();
+                isScannerListening = true;
+                UpdateUIState();
+
+                LogMessage($"Barcode scanner started on {barcodeScanner.PortName}", ColorSuccess);
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Failed to start barcode scanner: {ex.Message}", ColorError);
+                MessageBox.Show($"Failed to start barcode scanner: {ex.Message}", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void StopBarcodeScanner()
+        {
+            if (!isScannerListening || barcodeScanner == null)
+            {
+                return;
+            }
+
+            try
+            {
+                barcodeScanner.DataReceived -= BarcodeScanner_DataReceived;
+                barcodeScanner.Close();
+                barcodeScanner.Dispose();
+                barcodeScanner = null;
+                isScannerListening = false;
+                UpdateUIState();
+
+                LogMessage("Barcode scanner stopped", ColorSuccess);
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Error stopping barcode scanner: {ex.Message}", ColorError);
+            }
+        }
+
+        private void BarcodeScanner_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
+            try
+            {
+                SerialPort sp = (SerialPort)sender;
+                string barcodeData = sp.ReadExisting().Trim();
+
+                if (!string.IsNullOrEmpty(barcodeData))
+                {
+                    // Log the barcode data
+                    LogMessage($"Barcode scanned: {barcodeData}", ColorNormal);
+
+                    // Broadcast to all connected WebSocket clients
+                    BroadcastToClients(barcodeData);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"Error reading barcode data: {ex.Message}", ColorError);
+            }
+        }
+
+        private async void BroadcastToClients(string message)
+        {
+            if (connectedClients.Count == 0)
+            {
+                return;
+            }
+
+            var token = cancellationTokenSource.Token;
+            var messageBytes = Encoding.UTF8.GetBytes(message);
+            var messageSegment = new ArraySegment<byte>(messageBytes);
+
+            List<WebSocket> clientsToRemove = new List<WebSocket>();
+
+            lock (clientsLock)
+            {
+                foreach (var client in connectedClients)
+                {
+                    if (client.State == WebSocketState.Open)
+                    {
+                        try
+                        {
+                            client.SendAsync(
+                                messageSegment,
+                                WebSocketMessageType.Text,
+                                true,
+                                token);
+
+                            LogMessage($"Broadcasted barcode to client: {message}", ColorSent);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogMessage($"Error sending to client: {ex.Message}", ColorWarning);
+                            clientsToRemove.Add(client);
+                        }
+                    }
+                    else
+                    {
+                        clientsToRemove.Add(client);
+                    }
+                }
+
+                // Remove disconnected clients
+                foreach (var client in clientsToRemove)
+                {
+                    connectedClients.Remove(client);
+                    client.Dispose();
+                }
+            }
+        }
+
+        private StopBits GetStopBits(string stopBitsText)
+        {
+            return stopBitsText switch
+            {
+                "One" => StopBits.One,
+                "Two" => StopBits.Two,
+                "OnePointFive" => StopBits.OnePointFive,
+                _ => StopBits.One
+            };
+        }
+
+        private Parity GetParity(string parityText)
+        {
+            return parityText switch
+            {
+                "None" => Parity.None,
+                "Even" => Parity.Even,
+                "Odd" => Parity.Odd,
+                "Mark" => Parity.Mark,
+                "Space" => Parity.Space,
+                _ => Parity.None
+            };
         }
 
         private void StopWebSocketServer()
@@ -213,8 +444,27 @@ namespace BarcodeScannerServer
             try
             {
                 LogMessage("Stopping WebSocket server...", ColorWarning);
+
+                // Stop barcode scanner first
+                StopBarcodeScanner();
+
                 cancellationTokenSource?.Cancel();
                 httpListener?.Stop();
+
+                // Close all client connections
+                lock (clientsLock)
+                {
+                    foreach (var client in connectedClients)
+                    {
+                        try
+                        {
+                            client.Dispose();
+                        }
+                        catch { }
+                    }
+                    connectedClients.Clear();
+                }
+
                 isRunning = false;
                 UpdateUIState();
                 LogMessage("WebSocket server stopped successfully", ColorSuccess);
@@ -238,6 +488,19 @@ namespace BarcodeScannerServer
             // Setting the accessibility of the buttons
             buttonStart.Enabled = !isRunning;
             buttonStop.Enabled = isRunning;
+            buttonStartScanner.Enabled = isRunning && !isScannerListening;
+            buttonStopScanner.Enabled = isScannerListening;
+            buttonRefreshPorts.Enabled = !isScannerListening;
+
+            // COM port controls
+            comboBoxComPort.Enabled = !isScannerListening;
+            comboBoxBaudRate.Enabled = !isScannerListening;
+            comboBoxDataBits.Enabled = !isScannerListening;
+            comboBoxStopBits.Enabled = !isScannerListening;
+            comboBoxParity.Enabled = !isScannerListening;
+
+            // Updating the form title
+            this.Text = $"Barcode Scanner Server - {(isRunning ? "RUNNING" : "STOPPED")} - Scanner: {(isScannerListening ? "LISTENING" : "STOPPED")}";
 
             // Updating the form title
             this.Text = $"Barcode Scanner Server - {(isRunning ? "RUNNING" : "STOPPED")}";
